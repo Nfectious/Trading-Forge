@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     TIER_ELITE_BALANCE: int = 10000000  # $100,000
     TIER_VALKYRIE_BALANCE: int = 50000000  # $500,000
 
+    # Exchange API Keys (Optional)
+    KRAKEN_API_KEY: str | None = None
+    KRAKEN_API_SECRET: str | None = None
+    COINGECKO_API_KEY: str | None = None
+    OPENROUTER_API_KEY: str | None = None
+   
+
 
 # Global settings instance
 settings = Settings()
