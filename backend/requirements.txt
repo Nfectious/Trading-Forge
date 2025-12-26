@@ -40,3 +40,14 @@ pytz==2024.2
 
 # Monitoring & Logging
 python-json-logger==3.1.0
+
+# WebSocket & Exchange APIs
+websockets==12.0
+ccxt==4.2.25
+python-binance==1.0.19
+bybit==0.3.1
+krakenex==2.2.0
+aioredis==2.0.1
+
+# Optional: for advanced rate limiting
+aiolimiter==1.1.0

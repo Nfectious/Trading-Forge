@@ -7,11 +7,14 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
+from contextlib import asynccontextmanager
 import logging
+import aioredis
 
 from app.core.config import settings
 from app.core.security import limiter
 from app.core.database import close_db
+from app.core.websocket_manager import WebSocketManager
 
 # Configure logging
 logging.basicConfig(
@@ -20,13 +23,98 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
+
+# ============================================================================
+# GLOBAL STATE (WebSocket Manager & Redis)
+# ============================================================================
+
+redis_client = None
+ws_manager = None
+
+
+# ============================================================================
+# LIFESPAN CONTEXT MANAGER
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manage application lifespan - replaces @app.on_event decorators
+    Handles startup and shutdown logic
+    """
+    global redis_client, ws_manager
+    
+    # ==================== STARTUP ====================
+    logger.info("🚀 Starting Crypto Platform API")
+    logger.info(f"Environment: {settings.ENVIRONMENT}")
+    logger.info(f"Debug mode: {settings.DEBUG}")
+    
+    # Initialize Redis connection
+    try:
+        redis_client = await aioredis.from_url(
+            settings.REDIS_URL,
+            encoding="utf-8",
+            decode_responses=False
+        )
+        logger.info("✅ Redis connected")
+    except Exception as e:
+        logger.error(f"❌ Redis connection failed: {e}")
+        redis_client = None
+    
+    # Initialize WebSocket Manager (only if Redis is available)
+    if redis_client:
+        try:
+            ws_manager = WebSocketManager(redis_client)
+            await ws_manager.connect()
+            
+            # Subscribe to default trading pairs
+            await ws_manager.subscribe("binance", "BTCUSDT")
+            await ws_manager.subscribe("binance", "ETHUSDT")
+            await ws_manager.subscribe("binance", "SOLUSDT")
+            await ws_manager.subscribe("bybit", "BTCUSDT")
+            await ws_manager.subscribe("kraken", "XBT/USD")
+            await ws_manager.subscribe("kraken", "ETH/USD")
+            
+            logger.info("✅ Live price feeds operational")
+        except Exception as e:
+            logger.error(f"❌ WebSocket manager failed: {e}")
+            ws_manager = None
+    
+    logger.info("✅ Application startup complete")
+    
+    yield  # Application runs here
+    
+    # ==================== SHUTDOWN ====================
+    logger.info("🛑 Shutting down Crypto Platform API")
+    
+    # Disconnect WebSocket feeds
+    if ws_manager:
+        await ws_manager.disconnect()
+        logger.info("✅ WebSocket feeds closed")
+    
+    # Close Redis connection
+    if redis_client:
+        await redis_client.close()
+        logger.info("✅ Redis connection closed")
+    
+    # Close database connections
+    await close_db()
+    logger.info("✅ Database connections closed")
+    
+    logger.info("✅ Shutdown complete")
+
+
+# ============================================================================
+# CREATE FASTAPI APP
+# ============================================================================
+
 app = FastAPI(
     title="Crypto Simulation Platform API",
     description="Professional crypto trading simulation and education platform",
     version="1.0.0",
     docs_url="/docs" if settings.DEBUG else None,
-    redoc_url="/redoc" if settings.DEBUG else None
+    redoc_url="/redoc" if settings.DEBUG else None,
+    lifespan=lifespan  # ← Attach lifespan manager
 )
 
 # Add rate limiter
@@ -63,68 +151,6 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     )
 
 
-# ============================================================================
-# STARTUP/SHUTDOWN EVENTS
-# ============================================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """Execute on application startup"""
-    logger.info("Starting Crypto Platform API")
-    logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Debug mode: {settings.DEBUG}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Execute on application shutdown"""
-    logger.info("Shutting down Crypto Platform API")
-    await close_db()
-
-
-# ============================================================================
-# ROOT ENDPOINTS
-# ============================================================================
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Crypto Simulation Platform API",
-        "version": "1.0.0",
-        "status": "operational",
-        "environment": settings.ENVIRONMENT
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    return {
-        "status": "healthy",
-        "environment": settings.ENVIRONMENT
-    }
-
-
-# ============================================================================
-# API ROUTES
-# ============================================================================
-
-# Import routers (will be created)
-from app.api import auth, users, wallet, trading, admin
-
-# Include routers
-app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
-app.include_router(users.router, prefix="/users", tags=["Users"])
-app.include_router(wallet.router, prefix="/wallet", tags=["Wallet"])
-app.include_router(trading.router, prefix="/trading", tags=["Trading"])
-app.include_router(admin.router)
-
-
-# ============================================================================
-# ERROR HANDLING
-# ============================================================================
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler"""
@@ -145,6 +171,56 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal server error"}
     )
 
+
+# ============================================================================
+# ROOT ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Crypto Simulation Platform API",
+        "version": "1.0.0",
+        "status": "operational",
+        "environment": settings.ENVIRONMENT,
+        "websocket_status": "connected" if ws_manager and ws_manager.running else "disconnected",
+        "redis_status": "connected" if redis_client else "disconnected"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "environment": settings.ENVIRONMENT,
+        "services": {
+            "redis": "up" if redis_client else "down",
+            "websocket_feeds": "up" if ws_manager and ws_manager.running else "down"
+        }
+    }
+
+
+# ============================================================================
+# API ROUTES
+# ============================================================================
+
+# Import routers
+from app.api import auth, users, wallet, trading, admin, market
+
+# Include routers
+app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+app.include_router(users.router, prefix="/users", tags=["Users"])
+app.include_router(wallet.router, prefix="/wallet", tags=["Wallet"])
+app.include_router(trading.router, prefix="/trading", tags=["Trading"])
+app.include_router(market.router, prefix="/market", tags=["Market Data"])  # ← NEW
+app.include_router(admin.router)
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
